@@ -1,0 +1,346 @@
+/**
+ * Professional Voice-to-Text Converter
+ * Complete implementation with modular architecture, proper error handling,
+ * and production-ready features.
+ */
+
+#include "voice2text.h"
+#include "audio_capture.h"
+#include "feature_extraction.h"
+#include "vad.h"
+#include "api_client.h"
+#include "config.h"
+#include "logging.h"
+
+// Global context
+static v2t_context_t g_ctx;
+
+// Forward declarations
+static v2t_error_t initialize_subsystems(void);
+static void cleanup_subsystems(void);
+static void display_usage(void);
+static void realtime_display_thread(void *arg);
+
+// Signal handler for graceful shutdown
+static void signal_handler(int sig) {
+    LOG_INFO("Received signal %d, shutting down gracefully", sig);
+    g_ctx.signal_received = sig;
+    v2t_set_recording_state(false);
+}
+
+// Initialize all subsystems
+static v2t_error_t initialize_subsystems(void) {
+    v2t_error_t ret;
+    
+    // Initialize configuration
+    ret = config_init(&g_ctx.config);
+    if (ret != V2T_SUCCESS) {
+        LOG_CRITICAL("Configuration initialization failed: %d", ret);
+        return ret;
+    }
+
+    // Initialize logging
+    ret = logging_init(g_ctx.config.log_file, g_ctx.config.log_level);
+    if (ret != V2T_SUCCESS) {
+        LOG_CRITICAL("Logging initialization failed: %d", ret);
+        return ret;
+    }
+
+    LOG_INFO("=== Voice2Text v%s Initialization ===", V2T_VERSION);
+    LOG_INFO("Sample rate: %d Hz, Channels: %d", 
+             g_ctx.config.sample_rate, g_ctx.config.channels);
+
+    // Initialize audio capture
+    ret = audio_capture_init(&g_ctx.audio_capture, 
+                           g_ctx.config.sample_rate,
+                           g_ctx.config.channels,
+                           g_ctx.config.buffer_duration_ms);
+    if (ret != V2T_SUCCESS) {
+        LOG_CRITICAL("Audio capture initialization failed: %d", ret);
+        return ret;
+    }
+
+    // Initialize feature extraction
+    ret = feature_extraction_init(&g_ctx.feature_extractor,
+                                g_ctx.config.sample_rate,
+                                FFT_SIZE,
+                                NUM_MEL_FILTERS);
+    if (ret != V2T_SUCCESS) {
+        LOG_CRITICAL("Feature extraction initialization failed: %d", ret);
+        return ret;
+    }
+
+    // Initialize VAD
+    ret = vad_init(&g_ctx.vad_processor,
+                 g_ctx.config.vad_threshold,
+                 g_ctx.config.vad_silence_duration_ms,
+                 g_ctx.config.vad_speech_duration_ms);
+    if (ret != V2T_SUCCESS) {
+        LOG_CRITICAL("VAD initialization failed: %d", ret);
+        return ret;
+    }
+
+    // Initialize API client if enabled
+    if (g_ctx.config.use_api) {
+        ret = api_client_init(&g_ctx.api_client,
+                            g_ctx.config.api_endpoint,
+                            g_ctx.config.api_timeout_ms);
+        if (ret != V2T_SUCCESS) {
+            LOG_WARNING("API client initialization failed, continuing without API");
+            g_ctx.config.use_api = false;
+        }
+    }
+
+    // Initialize output mutex
+    if (pthread_mutex_init(&g_ctx.output_mutex, NULL) != 0) {
+        LOG_CRITICAL("Output mutex initialization failed");
+        return V2T_ERROR_THREAD;
+    }
+
+    g_ctx.is_initialized = true;
+    LOG_INFO("All subsystems initialized successfully");
+
+    return V2T_SUCCESS;
+}
+
+// Cleanup all subsystems
+static void cleanup_subsystems(void) {
+    LOG_INFO("Cleaning up subsystems");
+
+    // Stop recording if active
+    if (g_ctx.is_recording) {
+        v2t_set_recording_state(false);
+    }
+
+    // Cleanup subsystems in reverse order
+    if (g_ctx.config.use_api) {
+        api_client_cleanup(&g_ctx.api_client);
+    }
+
+    vad_cleanup(&g_ctx.vad_processor);
+    feature_extraction_cleanup(&g_ctx.feature_extractor);
+    audio_capture_cleanup(&g_ctx.audio_capture);
+    
+    pthread_mutex_destroy(&g_ctx.output_mutex);
+    config_cleanup(&g_ctx.config);
+    logging_cleanup();
+
+    g_ctx.is_initialized = false;
+    LOG_INFO("Cleanup complete");
+}
+
+// Real-time display thread
+static void* realtime_display_thread(void *arg) {
+    (void)arg;
+    
+    while (g_ctx.is_recording && !g_ctx.signal_received) {
+        // Get current transcription
+        char current_text[MAX_SENTENCE_LENGTH];
+        v2t_get_current_transcription(current_text, sizeof(current_text));
+        
+        if (strlen(current_text) > 0) {
+            // Clear line and display current text
+            printf("\r\033[K%s", current_text);
+            fflush(stdout);
+        }
+        
+        usleep(100000); // 100ms update rate
+    }
+    
+    return NULL;
+}
+
+// Main application logic
+static v2t_error_t run_application(void) {
+    v2t_error_t ret;
+    pthread_t display_thread;
+    
+    LOG_INFO("Starting application");
+
+    // Start real-time display thread
+    if (pthread_create(&display_thread, NULL, realtime_display_thread, NULL) != 0) {
+        LOG_ERROR("Failed to create display thread");
+        return V2T_ERROR_THREAD;
+    }
+
+    // Main processing loop
+    float audio_buffer[FRAMES_PER_BUFFER];
+    size_t consecutive_speech_frames = 0;
+    bool was_speaking = false;
+    
+    while (g_ctx.is_recording && !g_ctx.signal_received) {
+        // Capture audio frame
+        ret = audio_capture_read(&g_ctx.audio_capture, audio_buffer, FRAMES_PER_BUFFER);
+        if (ret != V2T_SUCCESS) {
+            if (ret == V2T_ERROR_TIMEOUT) {
+                continue; // Non-fatal timeout
+            }
+            LOG_ERROR("Audio capture error: %d", ret);
+            break;
+        }
+
+        // Perform VAD
+        bool is_speech = vad_process(&g_ctx.vad_processor, audio_buffer, FRAMES_PER_BUFFER);
+        
+        if (is_speech) {
+            consecutive_speech_frames++;
+            
+            // Extract features for speech frames
+            audio_features_t features = feature_extraction_process(
+                &g_ctx.feature_extractor, audio_buffer, FRAMES_PER_BUFFER);
+            
+            // Send to API if configured
+            if (g_ctx.config.use_api && consecutive_speech_frames > 2) {
+                ret = api_client_send_audio(&g_ctx.api_client, audio_buffer, FRAMES_PER_BUFFER);
+                if (ret != V2T_SUCCESS) {
+                    LOG_WARNING("API send failed: %d", ret);
+                }
+            }
+            
+            was_speaking = true;
+        } else if (was_speaking) {
+            // Speech segment ended
+            consecutive_speech_frames = 0;
+            was_speaking = false;
+            
+            if (g_ctx.config.use_api) {
+                // Finalize current speech segment
+                ret = api_client_finalize_segment(&g_ctx.api_client);
+                if (ret != V2T_SUCCESS) {
+                    LOG_WARNING("API segment finalization failed: %d", ret);
+                }
+            }
+        }
+
+        // Save to buffer for potential offline processing
+        if (g_ctx.config.save_audio) {
+            ret = audio_capture_save_to_buffer(&g_ctx.audio_capture, audio_buffer, FRAMES_PER_BUFFER);
+            if (ret != V2T_SUCCESS) {
+                LOG_WARNING("Buffer save failed: %d", ret);
+            }
+        }
+        
+        // Yield to prevent CPU spinning
+        usleep(1000);
+    }
+
+    // Wait for display thread
+    pthread_join(display_thread, NULL);
+    
+    printf("\n"); // New line after display thread
+    
+    return V2T_SUCCESS;
+}
+
+// Display usage information
+static void display_usage(void) {
+    printf("Voice2Text v%s - Professional Speech Recognition\n", V2T_VERSION);
+    printf("Usage: voice2text [OPTIONS]\n\n");
+    printf("Options:\n");
+    printf("  --help                 Show this help message\n");
+    printf("  --version              Show version information\n");
+    printf("  --config FILE          Load configuration from FILE\n");
+    printf("  --sample-rate RATE     Set audio sample rate (default: 16000)\n");
+    printf("  --channels NUM         Set number of audio channels (default: 1)\n");
+    printf("  --api-endpoint URL     Set API endpoint URL\n");
+    printf("  --no-api               Disable API integration\n");
+    printf("  --save-audio           Save recorded audio to file\n");
+    printf("  --log-level LEVEL      Set log level (debug, info, warning, error)\n");
+    printf("  --log-file FILE        Log to FILE instead of stderr\n");
+}
+
+// Main entry point
+int main(int argc, char *argv[]) {
+    v2t_error_t ret;
+    
+    // Initialize global context
+    memset(&g_ctx, 0, sizeof(v2t_context_t));
+    g_ctx.signal_received = 0;
+    g_ctx.is_initialized = false;
+    g_ctx.is_recording = false;
+
+    // Parse command line arguments
+    ret = config_parse_arguments(argc, argv, &g_ctx.config);
+    if (ret != V2T_SUCCESS) {
+        if (ret == V2T_ERROR_INVALID_PARAM) {
+            display_usage();
+            return 1;
+        }
+        fprintf(stderr, "Failed to parse arguments: %d\n", ret);
+        return 1;
+    }
+
+    // Show version if requested
+    if (g_ctx.config.show_version) {
+        printf("Voice2Text v%s\n", V2T_VERSION);
+        return 0;
+    }
+
+    // Initialize all subsystems
+    ret = initialize_subsystems();
+    if (ret != V2T_SUCCESS) {
+        fprintf(stderr, "Initialization failed: %d\n", ret);
+        return 1;
+    }
+
+    // Set up signal handlers
+    struct sigaction sa = {
+        .sa_handler = signal_handler,
+        .sa_flags = 0
+    };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+#ifndef _WIN32
+    sigaction(SIGQUIT, &sa, NULL);
+#endif
+
+    printf("Voice2Text v%s - Ready\n", V2T_VERSION);
+    printf("Press Enter to start recording, Ctrl+C to exit\n");
+    printf("Sample rate: %d Hz, Channels: %d\n", 
+           g_ctx.config.sample_rate, g_ctx.config.channels);
+    
+    if (g_ctx.config.use_api) {
+        printf("API endpoint: %s\n", g_ctx.config.api_endpoint);
+    }
+    
+    printf("\n");
+
+    // Wait for user input to start
+    getchar();
+
+    // Start recording
+    LOG_INFO("Starting recording session");
+    v2t_set_recording_state(true);
+
+    printf("Recording... Speak now\n");
+    printf("Real-time transcription:\n");
+
+    // Run main application loop
+    ret = run_application();
+    
+    // Stop recording
+    v2t_set_recording_state(false);
+
+    // Save audio if requested
+    if (g_ctx.config.save_audio && g_ctx.audio_capture.buffer.size > 0) {
+        char filename[256];
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        strftime(filename, sizeof(filename), "recording_%Y%m%d_%H%M%S.wav", tm);
+        
+        ret = audio_capture_save_to_file(&g_ctx.audio_capture, filename);
+        if (ret == V2T_SUCCESS) {
+            printf("Audio saved to: %s\n", filename);
+        } else {
+            printf("Failed to save audio: %d\n", ret);
+        }
+    }
+
+    printf("\nSession completed\n");
+
+    // Cleanup
+    cleanup_subsystems();
+
+    return (ret == V2T_SUCCESS) ? 0 : 1;
+}
